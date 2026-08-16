@@ -29,6 +29,7 @@ import {
   applyPaperclipWorkspaceEnv,
   asNumber,
   asString,
+  asStringArray,
   buildInvocationEnvForLogs,
   buildPaperclipEnv,
   ensureAbsoluteDirectory,
@@ -76,6 +77,7 @@ import {
   DEFAULT_ACP_ENGINE_TIMEOUT_SEC,
   DEFAULT_ACP_ENGINE_WARM_HANDLE_IDLE_MS,
 } from "./constants.js";
+import { resolveExtraArgsMcpServers } from "./mcp-config.js";
 
 const defaultModuleDir = path.dirname(fileURLToPath(import.meta.url));
 const PAPERCLIP_MANAGED_CODEX_SKILLS_MANIFEST = ".paperclip-managed-skills.json";
@@ -1120,6 +1122,35 @@ async function buildRuntime(input: {
       );
     }
     if (codexStartupConfig.value) env.CODEX_CONFIG = codexStartupConfig.value;
+  }
+
+  // extraArgs is a CLI-lane concept and there is no argv to append it to here.
+  // Translate the one flag with an ACP equivalent (`--mcp-config` -> session
+  // mcpServers) against the env resolved just above, and log every entry that
+  // stays unhonored: a config field that looks applied and does nothing is the
+  // failure this lane shipped for months (FIG-1536).
+  const extraArgs = asStringArray(config.extraArgs);
+  if (extraArgs.length > 0) {
+    const extraArgsMcp = await resolveExtraArgsMcpServers({
+      extraArgs,
+      cwd,
+      env,
+      executionTargetIsRemote,
+      reservedNames: mcpIdentity.map(({ name }) => name),
+    });
+    mcpServers.push(...extraArgsMcp.servers);
+    mcpIdentity.push(...extraArgsMcp.identities);
+    if (extraArgsMcp.identities.length > 0) {
+      await input.ctx.onLog(
+        "stdout",
+        `[paperclip] Mounted ${extraArgsMcp.identities.length} MCP server(s) from adapterConfig.extraArgs: ${extraArgsMcp.identities
+          .map(({ name }) => name)
+          .join(", ")}.\n`,
+      );
+    }
+    for (const warning of extraArgsMcp.warnings) {
+      await input.ctx.onLog("stderr", `[paperclip] ${warning}\n`);
+    }
   }
 
   let skillPromptInstructions = "";

@@ -1280,6 +1280,59 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(first.result.sessionParams?.configFingerprint).toBe(rotatedToken.result.sessionParams?.configFingerprint);
     expect(first.result.sessionParams?.configFingerprint).not.toBe(changedSet.result.sessionParams?.configFingerprint);
   });
+
+  it("mounts MCP servers declared by extraArgs --mcp-config and never drops an extra arg in silence", async () => {
+    const root = await makeTempRoot();
+    const mcpConfigPath = path.join(root, "fleet-mcp.json");
+    await fs.writeFile(
+      mcpConfigPath,
+      JSON.stringify({
+        mcpServers: {
+          "vps-mcp-figmenta": {
+            type: "http",
+            url: "https://vps-mcp.example/mcp",
+            headers: { Authorization: "Bearer ${VPS_MCP_FIGMENTA_TOKEN}" },
+          },
+        },
+      }),
+      "utf8",
+    );
+    const baseConfig = {
+      agent: "custom",
+      agentCommand: "node ./fake-acp.js",
+      stateDir: path.join(root, "state"),
+      env: { VPS_MCP_FIGMENTA_TOKEN: "fleet-token" },
+      extraArgs: ["--mcp-config", mcpConfigPath, "--strict-mcp-config"],
+    };
+
+    const mounted = await runExecutor(baseConfig);
+
+    expect(mounted.runtimeOptions[0]?.mcpServers).toEqual([{
+      type: "http",
+      name: "vps-mcp-figmenta",
+      url: "https://vps-mcp.example/mcp",
+      headers: [{ name: "Authorization", value: "Bearer fleet-token" }],
+    }]);
+    expect(mounted.result.sessionParams?.mcpServers).toEqual([{
+      name: "vps-mcp-figmenta",
+      url: "https://vps-mcp.example/mcp",
+      connectionId: "adapter-config:extraArgs",
+    }]);
+    expect(JSON.stringify(mounted.result.sessionParams)).not.toContain("fleet-token");
+    expect(mounted.logs.some((entry) => entry.text.includes("Mounted 1 MCP server(s) from adapterConfig.extraArgs"))).toBe(true);
+    expect(mounted.logs.some((entry) => entry.stream === "stderr" && entry.text.includes("--strict-mcp-config"))).toBe(true);
+
+    const withoutToken = await runExecutor({ ...baseConfig, env: {} });
+    expect(withoutToken.runtimeOptions[0]?.mcpServers).toEqual([]);
+    expect(
+      withoutToken.logs.some(
+        (entry) => entry.stream === "stderr" && entry.text.includes("${VPS_MCP_FIGMENTA_TOKEN} is not set"),
+      ),
+    ).toBe(true);
+    expect(mounted.result.sessionParams?.configFingerprint).not.toBe(
+      withoutToken.result.sessionParams?.configFingerprint,
+    );
+  });
 });
 
 describe("findAncestorBin", () => {
