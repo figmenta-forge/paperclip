@@ -996,6 +996,16 @@ async function buildRuntime(input: {
       ? remoteExecutionIdentity.remoteCwd
       : cwd;
   const executionTargetIsRemote = remoteExecutionIdentity !== null;
+  // Whether a `${VAR}` in an extraArgs `--mcp-config` may travel unexpanded
+  // depends on the env the child expands against, not on where the child runs.
+  // `sandbox` is the only remote transport this engine launches a child for,
+  // and it hands that child `runtimeEnv` (a superset of `env`, see the
+  // process-session bridge below), so a placeholder validated here is one the
+  // child can resolve — substituting would republish the value into the
+  // sandbox child's argv for nothing. An ssh target gets no such bridge here,
+  // so its env stays foreign.
+  const childEnvIsForeign =
+    executionTargetIsRemote && !(executionTarget?.kind === "remote" && executionTarget.transport === "sandbox");
   const shapedWorkspaceEnv = shapePaperclipWorkspaceEnvForExecution({
     workspaceCwd: effectiveWorkspaceCwd,
     workspaceWorktreePath,
@@ -1138,6 +1148,7 @@ async function buildRuntime(input: {
       // Decides whether a `${VAR}` may travel unexpanded: only claude expands
       // it downstream, so codex/gemini/custom still need the substitution.
       agent: acpxAgent,
+      childEnvIsForeign,
       executionTargetIsRemote,
       reservedNames: mcpIdentity.map(({ name }) => name),
     });

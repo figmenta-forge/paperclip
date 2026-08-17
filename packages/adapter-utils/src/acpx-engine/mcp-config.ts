@@ -17,6 +17,10 @@ type McpServer = NonNullable<AcpRuntimeOptions["mcpServers"]>[number];
 
 export interface ExtraArgsMcpIdentity {
   name: string;
+  /**
+   * The server's address as *written* in the config — url for http/sse,
+   * `command args…` for stdio — never the resolved form. See `toServer`.
+   */
   url: string;
   connectionId: string;
 }
@@ -43,6 +47,18 @@ export interface ResolveExtraArgsMcpInput {
    * so a new lane cannot inherit the claude assumption by omission.
    */
   agent: string;
+  /**
+   * True when the child expands `${VAR}` against an env this process did not
+   * hand it — substituting here is then the only way the value can arrive.
+   *
+   * Deliberately not `executionTargetIsRemote`, which answers a different
+   * question (where does the config *file* live) and only stood in for this
+   * one. A sandbox target is remote and still runs its child under the env
+   * this process shipped it, so "remote" over-reports foreignness and buys a
+   * gratuitous argv exposure. Required, like `agent`, so a caller has to
+   * answer rather than inherit an assumption by omission.
+   */
+  childEnvIsForeign: boolean;
   /** Remote targets keep their config files on the remote host. */
   executionTargetIsRemote?: boolean;
   /** Names already taken by Paperclip tool connections; those win. */
@@ -197,9 +213,11 @@ function makeResolvePlan(input: ResolveExtraArgsMcpInput): ResolvePlan {
   // would have made that a silent regression — the exact "config field that
   // looks applied and does nothing" this module exists to end (FIG-1536).
   //
-  // Remote keeps substituting for its own, separate reason: its child runs
-  // under an env this process does not own.
-  const substituting = input.agent !== "claude" || input.executionTargetIsRemote === true;
+  // The second reason to substitute is separate and narrower than "remote":
+  // a child that expands against an env this process never handed it cannot
+  // resolve a placeholder, so the value has to travel resolved. `remote` was
+  // the stand-in for that and over-reports it — see `childEnvIsForeign`.
+  const substituting = input.agent !== "claude" || input.childEnvIsForeign;
   const pendingSubstituted = new Set<string>();
   const resolve: Resolver = substituting
     ? (value) => expandEnv(value, input.env, (name) => pendingSubstituted.add(name))
@@ -224,7 +242,7 @@ function describeSubstitution(input: ResolveExtraArgsMcpInput, plan: ResolvePlan
   const reason =
     input.agent !== "claude"
       ? `the "${input.agent}" agent does not expand \${VAR} itself (only "claude" does), so the placeholder cannot be passed through`
-      : "the execution target is remote, whose child env this process does not own";
+      : "the child expands against an env this process does not supply, so the placeholder would not resolve there";
   return (
     `--mcp-config: ${names} substituted into the MCP config because ${reason}. ` +
     `The value transits the child's argv, which /proc/<pid>/cmdline exposes to every local uid (0444); ` +
@@ -263,6 +281,18 @@ function toHeaderList(
   return headers;
 }
 
+/**
+ * The server carries resolved values; the identity carries the ones as
+ * written. They are different objects with different destinations: the server
+ * goes to the agent over `session/new`, the identity goes back to the host in
+ * the run's `sessionParams` and into the config fingerprint. Only the first
+ * needs the value, so on a substituting lane a resolved identity would put a
+ * credential on a surface that has no use for it — the same class as FIG-1550,
+ * one surface over. Nothing is lost: a rotation still invalidates the warm
+ * session through the resolved adapter env, which is hashed into the same
+ * fingerprint, and the placeholder is the more stable name for the server
+ * anyway.
+ */
 function toServer(
   name: string,
   entry: Record<string, unknown>,
@@ -279,23 +309,22 @@ function toServer(
     const server = (type === "sse"
       ? { type: "sse", name, url: expandedUrl, headers }
       : { type: "http", name, url: expandedUrl, headers }) as McpServer;
-    return { server, identity: { name, url: expandedUrl, connectionId: "adapter-config:extraArgs" } };
+    return { server, identity: { name, url, connectionId: "adapter-config:extraArgs" } };
   }
 
   if (command) {
     const expandedCommand = resolve(command);
-    const args = Array.isArray(entry.args)
-      ? entry.args
-          .filter((arg): arg is string => typeof arg === "string")
-          .map((arg) => {
-            // Passing a placeholder through keeps it out of *this* child's
-            // argv, but a stdio server is then spawned by that child from the
-            // expanded args — the value lands in the MCP server process's own
-            // cmdline. Record it so the residue is reported, not implied away.
-            if (!plan.substituting) collectPlaceholderNames(arg, plan.pendingStdioArgs);
-            return resolve(arg);
-          })
+    const rawArgs = Array.isArray(entry.args)
+      ? entry.args.filter((arg): arg is string => typeof arg === "string")
       : [];
+    const args = rawArgs.map((arg) => {
+      // Passing a placeholder through keeps it out of *this* child's argv, but
+      // a stdio server is then spawned by that child from the expanded args —
+      // the value lands in the MCP server process's own cmdline. Record it so
+      // the residue is reported, not implied away.
+      if (!plan.substituting) collectPlaceholderNames(arg, plan.pendingStdioArgs);
+      return resolve(arg);
+    });
     const serverEnv = toHeaderList(entry.env, resolve);
     const server = {
       name,
@@ -307,7 +336,7 @@ function toServer(
       server,
       identity: {
         name,
-        url: [expandedCommand, ...args].join(" "),
+        url: [command, ...rawArgs].join(" "),
         connectionId: "adapter-config:extraArgs",
       },
     };

@@ -1333,6 +1333,112 @@ describe("shared ACPX engine runtime behavior", () => {
       withoutToken.result.sessionParams?.configFingerprint,
     );
   });
+
+  it("passes an MCP placeholder through on a sandbox target and substitutes on ssh", async () => {
+    const root = await makeTempRoot();
+    const cwd = path.join(root, "worktree");
+    await fs.mkdir(cwd, { recursive: true });
+    const baseConfig = {
+      agent: "claude",
+      agentCommand: "node ./fake-acp.js",
+      stateDir: path.join(root, "state"),
+      cwd,
+      env: { VPS_MCP_FIGMENTA_TOKEN: "fleet-token" },
+      // Inline, because a file-based --mcp-config is not read for a remote
+      // target: the file lives on the remote host.
+      extraArgs: [
+        `--mcp-config={"mcpServers":{"vps":{"type":"http","url":"https://vps-mcp.example/mcp","headers":{"Authorization":"Bearer \${VPS_MCP_FIGMENTA_TOKEN}"}}}}`,
+      ],
+    };
+
+    // A sandbox child is launched with the env this process shipped it, so it
+    // expands `${VAR}` itself exactly as a local claude does. Substituting
+    // would put the token in that child's argv (0444) for no benefit.
+    const sandbox = await runExecutor(baseConfig, {
+      executionTarget: { kind: "remote", transport: "sandbox", providerKey: "acme-sandbox", remoteCwd: cwd },
+    });
+    expect(sandbox.runtimeOptions[0]?.mcpServers).toEqual([{
+      type: "http",
+      name: "vps",
+      url: "https://vps-mcp.example/mcp",
+      headers: [{ name: "Authorization", value: "Bearer ${VPS_MCP_FIGMENTA_TOKEN}" }],
+    }]);
+
+    // ssh gets no such bridge from this engine, so its child env stays foreign
+    // and the value still has to travel resolved — reported, not hidden.
+    const ssh = await runExecutor(baseConfig, {
+      executionTarget: {
+        kind: "remote",
+        transport: "ssh",
+        remoteCwd: cwd,
+        spec: { host: "vps-06.example", port: 22, username: "ivan", remoteCwd: cwd },
+      },
+    });
+    expect(ssh.runtimeOptions[0]?.mcpServers).toEqual([{
+      type: "http",
+      name: "vps",
+      url: "https://vps-mcp.example/mcp",
+      headers: [{ name: "Authorization", value: "Bearer fleet-token" }],
+    }]);
+    expect(
+      ssh.logs.some(
+        (entry) => entry.stream === "stderr" && entry.text.includes("an env this process does not supply"),
+      ),
+    ).toBe(true);
+  });
+
+  it("keeps a substituted credential out of the session identity it hands back to the host", async () => {
+    const root = await makeTempRoot();
+    // A stdio server on a substituting lane: "custom" does not expand ${VAR}
+    // itself, so the value has to be resolved into `command`/`args` for the
+    // server to work at all. That resolution is correct; carrying it into the
+    // identity is not. The identity's only jobs are naming the server, feeding
+    // the fingerprint, and travelling back to the host in `sessionParams` —
+    // none of them need the value, and the two tests above already state the
+    // rule this one extends: no credential in `sessionParams`.
+    const mounted = await runExecutor({
+      agent: "custom",
+      agentCommand: "node ./fake-acp.js",
+      stateDir: path.join(root, "state"),
+      env: { VPS_MCP_FIGMENTA_TOKEN: "fleet-token" },
+      extraArgs: [
+        `--mcp-config={"mcpServers":{"vps":{"command":"srv-\${VPS_MCP_FIGMENTA_TOKEN}","args":["--key","\${VPS_MCP_FIGMENTA_TOKEN}"]}}}`,
+      ],
+    });
+
+    // The server itself keeps the resolved value — that is the whole point of
+    // the substituting lane.
+    expect(mounted.runtimeOptions[0]?.mcpServers).toEqual([{
+      name: "vps",
+      command: "srv-fleet-token",
+      args: ["--key", "fleet-token"],
+      env: [],
+    }]);
+    // The identity keeps the placeholder, which is stable across a rotation and
+    // is not a secret.
+    expect(mounted.result.sessionParams?.mcpServers).toEqual([{
+      name: "vps",
+      url: "srv-${VPS_MCP_FIGMENTA_TOKEN} --key ${VPS_MCP_FIGMENTA_TOKEN}",
+      connectionId: "adapter-config:extraArgs",
+    }]);
+    expect(JSON.stringify(mounted.result.sessionParams)).not.toContain("fleet-token");
+
+    // Rotating the secret still invalidates the warm session: the value reaches
+    // the fingerprint through the resolved adapter env, not through the
+    // identity, so dropping it from the identity costs no reuse precision.
+    const rotated = await runExecutor({
+      agent: "custom",
+      agentCommand: "node ./fake-acp.js",
+      stateDir: path.join(root, "state"),
+      env: { VPS_MCP_FIGMENTA_TOKEN: "fleet-token-2" },
+      extraArgs: [
+        `--mcp-config={"mcpServers":{"vps":{"command":"srv-\${VPS_MCP_FIGMENTA_TOKEN}","args":["--key","\${VPS_MCP_FIGMENTA_TOKEN}"]}}}`,
+      ],
+    });
+    expect(mounted.result.sessionParams?.configFingerprint).not.toBe(
+      rotated.result.sessionParams?.configFingerprint,
+    );
+  });
 });
 
 describe("findAncestorBin", () => {
