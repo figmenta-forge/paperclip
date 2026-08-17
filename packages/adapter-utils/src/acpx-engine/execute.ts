@@ -1135,6 +1135,9 @@ async function buildRuntime(input: {
       extraArgs,
       cwd,
       env,
+      // Decides whether a `${VAR}` may travel unexpanded: only claude expands
+      // it downstream, so codex/gemini/custom still need the substitution.
+      agent: acpxAgent,
       executionTargetIsRemote,
       reservedNames: mcpIdentity.map(({ name }) => name),
     });
