@@ -20,7 +20,7 @@ function readFileFrom(files: Record<string, string>) {
 }
 
 describe("resolveExtraArgsMcpServers", () => {
-  it("mounts an http server from a --mcp-config file and expands env placeholders", async () => {
+  it("mounts an http server from a --mcp-config file without resolving the credential into it", async () => {
     const result = await resolveExtraArgsMcpServers({
       extraArgs: ["--mcp-config", "/etc/fleet-mcp.json"],
       cwd: "/work",
@@ -28,14 +28,17 @@ describe("resolveExtraArgsMcpServers", () => {
       readFile: readFileFrom({ "/etc/fleet-mcp.json": FLEET_CONFIG }),
     });
 
+    // The placeholder travels; the secret does not. Whatever we put here is
+    // serialized into the child's argv, which every local uid can read.
     expect(result.servers).toEqual([
       {
         type: "http",
         name: "vps-mcp-figmenta",
         url: "https://vps-mcp.example/mcp",
-        headers: [{ name: "Authorization", value: "Bearer t0ken" }],
+        headers: [{ name: "Authorization", value: "Bearer ${VPS_MCP_TOKEN}" }],
       },
     ]);
+    expect(JSON.stringify(result)).not.toContain("t0ken");
     expect(result.identities).toEqual([
       {
         name: "vps-mcp-figmenta",
@@ -45,6 +48,69 @@ describe("resolveExtraArgsMcpServers", () => {
     ]);
     expect(result.warnings).toEqual([]);
     expect(result.honoredSources).toEqual(["/etc/fleet-mcp.json"]);
+  });
+
+  it("keeps a stdio server's args and env unresolved too", async () => {
+    const result = await resolveExtraArgsMcpServers({
+      extraArgs: [
+        `--mcp-config={"mcpServers":{"s":{"command":"srv","args":["--key","\${VPS_MCP_TOKEN}"],"env":{"KEY":"\${VPS_MCP_TOKEN}"}}}}`,
+      ],
+      cwd: "/work",
+      env: { VPS_MCP_TOKEN: "t0ken" },
+    });
+
+    expect(result.servers).toEqual([
+      {
+        name: "s",
+        command: "srv",
+        args: ["--key", "${VPS_MCP_TOKEN}"],
+        env: [{ name: "KEY", value: "${VPS_MCP_TOKEN}" }],
+      },
+    ]);
+    expect(JSON.stringify(result)).not.toContain("t0ken");
+  });
+
+  it("still applies a ${VAR:-default} fallback decision without substituting a set value", async () => {
+    const config = JSON.stringify({
+      mcpServers: {
+        a: { type: "http", url: "https://a.example/mcp", headers: { Authorization: "Bearer ${A:-anon}" } },
+        b: { type: "http", url: "https://b.example/mcp", headers: { Authorization: "Bearer ${B:-anon}" } },
+      },
+    });
+    const result = await resolveExtraArgsMcpServers({
+      extraArgs: ["--mcp-config", "/etc/c.json"],
+      cwd: "/work",
+      env: { A: "secret" },
+      readFile: readFileFrom({ "/etc/c.json": config }),
+    });
+
+    // Both mount: the child resolves ${A} from the same env we validated
+    // against, and falls back to `anon` for the unset ${B} exactly as we would.
+    expect(result.servers.map((server) => server.name)).toEqual(["a", "b"]);
+    expect(JSON.stringify(result)).not.toContain("secret");
+  });
+
+  it("keeps substituting for a remote target, whose child env this process does not own", async () => {
+    const inline = JSON.stringify({
+      mcpServers: {
+        r: { type: "http", url: "https://r.example/mcp", headers: { Authorization: "Bearer ${VPS_MCP_TOKEN}" } },
+      },
+    });
+    const result = await resolveExtraArgsMcpServers({
+      extraArgs: [`--mcp-config=${inline}`],
+      cwd: "/work",
+      env: { VPS_MCP_TOKEN: "t0ken" },
+      executionTargetIsRemote: true,
+    });
+
+    expect(result.servers).toEqual([
+      {
+        type: "http",
+        name: "r",
+        url: "https://r.example/mcp",
+        headers: [{ name: "Authorization", value: "Bearer t0ken" }],
+      },
+    ]);
   });
 
   it("accepts --mcp-config=<path>, relative paths, and inline JSON", async () => {

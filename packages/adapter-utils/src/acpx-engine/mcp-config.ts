@@ -97,6 +97,36 @@ function expandEnv(value: string, env: Record<string, string>): string {
   });
 }
 
+/**
+ * A value resolved here does not stay here: it is handed to the agent over
+ * `session/new`, and the Claude Agent SDK serializes those servers straight
+ * into the child's argv (`--mcp-config <inline JSON>`). `/proc/<pid>/cmdline`
+ * is world-readable (0444) while `/proc/<pid>/environ` is not (0400), so
+ * substituting a `${TOKEN}` here republishes it to every local uid, while
+ * leaving the placeholder alone keeps it in the private surface it came from.
+ *
+ * The child expands the very same syntax against the very same env — the env
+ * this module validates against is the resolved child env — so passing the
+ * placeholder through is not a downgrade: the credential still arrives, it
+ * just never transits argv. Validation is unchanged and still runs first, so
+ * a server whose `${VAR}` is unset is skipped here exactly as before and a
+ * literal `${VAR}` can never reach the wire as a broken header.
+ */
+function validateOnly(value: string, env: Record<string, string>): string {
+  expandEnv(value, env);
+  return value;
+}
+
+type Resolver = (value: string) => string;
+
+function makeResolver(input: ResolveExtraArgsMcpInput): Resolver {
+  // A remote target runs the child under an env this process does not own, so
+  // a placeholder there would be expanded against the wrong environment, or
+  // not at all. Remote keeps the substitution, and the argv exposure with it.
+  const resolve = input.executionTargetIsRemote ? expandEnv : validateOnly;
+  return (value: string) => resolve(value, input.env);
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -116,14 +146,14 @@ function readServerMap(parsed: unknown): Record<string, unknown> | null {
 
 function toHeaderList(
   value: unknown,
-  env: Record<string, string>,
+  resolve: Resolver,
 ): Array<{ name: string; value: string }> {
   const record = asRecord(value);
   if (!record) return [];
   const headers: Array<{ name: string; value: string }> = [];
   for (const [name, raw] of Object.entries(record)) {
     if (typeof raw !== "string") continue;
-    headers.push({ name, value: expandEnv(raw, env) });
+    headers.push({ name, value: resolve(raw) });
   }
   return headers;
 }
@@ -131,15 +161,15 @@ function toHeaderList(
 function toServer(
   name: string,
   entry: Record<string, unknown>,
-  env: Record<string, string>,
+  resolve: Resolver,
 ): { server: McpServer; identity: ExtraArgsMcpIdentity } | null {
   const type = asTrimmedString(entry.type).toLowerCase();
   const url = asTrimmedString(entry.url);
   const command = asTrimmedString(entry.command);
 
   if (url && type !== "stdio") {
-    const expandedUrl = expandEnv(url, env);
-    const headers = toHeaderList(entry.headers, env);
+    const expandedUrl = resolve(url);
+    const headers = toHeaderList(entry.headers, resolve);
     const server = (type === "sse"
       ? { type: "sse", name, url: expandedUrl, headers }
       : { type: "http", name, url: expandedUrl, headers }) as McpServer;
@@ -147,11 +177,11 @@ function toServer(
   }
 
   if (command) {
-    const expandedCommand = expandEnv(command, env);
+    const expandedCommand = resolve(command);
     const args = Array.isArray(entry.args)
-      ? entry.args.filter((arg): arg is string => typeof arg === "string").map((arg) => expandEnv(arg, env))
+      ? entry.args.filter((arg): arg is string => typeof arg === "string").map((arg) => resolve(arg))
       : [];
-    const serverEnv = toHeaderList(entry.env, env);
+    const serverEnv = toHeaderList(entry.env, resolve);
     const server = {
       name,
       command: expandedCommand,
@@ -220,6 +250,7 @@ export async function resolveExtraArgsMcpServers(
   const warnings: string[] = [];
   const honoredSources: string[] = [];
   const taken = new Set(input.reservedNames ?? []);
+  const resolve = makeResolver(input);
 
   const { values, unsupported } = collectMcpConfigValues(input.extraArgs);
   if (unsupported.length > 0) {
@@ -247,7 +278,7 @@ export async function resolveExtraArgsMcpServers(
       }
       let built: { server: McpServer; identity: ExtraArgsMcpIdentity } | null;
       try {
-        built = toServer(name, entry, input.env);
+        built = toServer(name, entry, resolve);
       } catch (error) {
         if (error instanceof UnresolvedPlaceholderError) {
           warnings.push(
