@@ -36,6 +36,13 @@ export interface ResolveExtraArgsMcpInput {
   cwd: string;
   /** Resolved child env, used to expand `${VAR}` / `${VAR:-default}`. */
   env: Record<string, string>;
+  /**
+   * ACPX agent id this config is bound for (`execute.ts` `acpxAgent`). Whether
+   * a `${VAR}` may travel unexpanded is a property of *this*, not of the
+   * execution target: only the claude CLI expands the syntax itself. Required
+   * so a new lane cannot inherit the claude assumption by omission.
+   */
+  agent: string;
   /** Remote targets keep their config files on the remote host. */
   executionTargetIsRemote?: boolean;
   /** Names already taken by Paperclip tool connections; those win. */
@@ -88,10 +95,30 @@ class UnresolvedPlaceholderError extends Error {
   }
 }
 
-function expandEnv(value: string, env: Record<string, string>): string {
+function collectPlaceholderNames(value: string, into: Set<string>): void {
+  for (const match of value.matchAll(ENV_PLACEHOLDER)) into.add(match[1] as string);
+}
+
+/**
+ * `typeof resolved === "string"` and not `resolved.length > 0`: an empty value
+ * counts as *set*, because that is what the agent that re-expands this does.
+ * Measured on the served claude binary: `if (typeof d === "string") return d`,
+ * so `${A:-anon}` with `A=""` yields `""` there. Reading `""` as unset here
+ * would validate against `anon` while the child ships the empty string — the
+ * two sides must answer "is it set?" the same way or the value on the wire is
+ * not the value we checked.
+ */
+function expandEnv(
+  value: string,
+  env: Record<string, string>,
+  onSubstitute?: (name: string) => void,
+): string {
   return value.replace(ENV_PLACEHOLDER, (_match, name: string, fallback?: string) => {
     const resolved = env[name];
-    if (typeof resolved === "string" && resolved.length > 0) return resolved;
+    if (typeof resolved === "string") {
+      if (resolved.length > 0) onSubstitute?.(name);
+      return resolved;
+    }
     if (typeof fallback === "string") return fallback;
     throw new UnresolvedPlaceholderError(name);
   });
@@ -105,12 +132,22 @@ function expandEnv(value: string, env: Record<string, string>): string {
  * substituting a `${TOKEN}` here republishes it to every local uid, while
  * leaving the placeholder alone keeps it in the private surface it came from.
  *
- * The child expands the very same syntax against the very same env — the env
- * this module validates against is the resolved child env — so passing the
- * placeholder through is not a downgrade: the credential still arrives, it
- * just never transits argv. Validation is unchanged and still runs first, so
- * a server whose `${VAR}` is unset is skipped here exactly as before and a
- * literal `${VAR}` can never reach the wire as a broken header.
+ * This is sound only where the destination agent expands the very same syntax
+ * against the very same env — the claude CLI does, measured on the served
+ * binary (`expandVars` on the `--mcp-config` path, same
+ * `${VAR}` / `${VAR:-default}` grammar). `makeResolvePlan` is what restricts
+ * the pass-through to that one agent; everywhere else the placeholder would
+ * ship literally and break the server.
+ *
+ * Validation still runs first, so a server whose `${VAR}` is unset is skipped
+ * here exactly as before. What that does *not* buy is a guarantee about the
+ * wire: it holds in this process, not in the child. The child does not fail
+ * closed — on a missing variable its expander returns the original `${VAR}`
+ * match, records it as missing, and mounts the server anyway with a broken
+ * value. Any drift between the env validated here and the env the child
+ * expands against therefore turns a skip here into a live server with a bad
+ * header there. Treat this as an assumption about the child, not as an
+ * invariant this module enforces.
  */
 function validateOnly(value: string, env: Record<string, string>): string {
   expandEnv(value, env);
@@ -119,12 +156,80 @@ function validateOnly(value: string, env: Record<string, string>): string {
 
 type Resolver = (value: string) => string;
 
-function makeResolver(input: ResolveExtraArgsMcpInput): Resolver {
-  // A remote target runs the child under an env this process does not own, so
-  // a placeholder there would be expanded against the wrong environment, or
-  // not at all. Remote keeps the substitution, and the argv exposure with it.
-  const resolve = input.executionTargetIsRemote ? expandEnv : validateOnly;
-  return (value: string) => resolve(value, input.env);
+interface ResolvePlan {
+  resolve: Resolver;
+  /** False when placeholders travel unexpanded (claude, local). */
+  substituting: boolean;
+  /** Names whose value was substituted into a *mounted* server, hence into argv. */
+  substituted: Set<string>;
+  /** Names left unexpanded inside a *mounted* stdio server's `args`. */
+  stdioArgPlaceholders: Set<string>;
+  /**
+   * Resolution happens before we know whether the server survives (a later
+   * placeholder in the same entry can be unset and skip the whole thing), so
+   * names land here first and are promoted only once the server is mounted.
+   * Reporting an exposure for a server that was skipped would be a false
+   * claim, and these warnings exist to be believed.
+   */
+  pendingSubstituted: Set<string>;
+  pendingStdioArgs: Set<string>;
+}
+
+function settlePending(plan: ResolvePlan, mounted: boolean): void {
+  if (mounted) {
+    for (const name of plan.pendingSubstituted) plan.substituted.add(name);
+    for (const name of plan.pendingStdioArgs) plan.stdioArgPlaceholders.add(name);
+  }
+  plan.pendingSubstituted.clear();
+  plan.pendingStdioArgs.clear();
+}
+
+function makeResolvePlan(input: ResolveExtraArgsMcpInput): ResolvePlan {
+  // The condition is "does the destination agent expand `${VAR}` itself", a
+  // property of the agent — not of local-vs-remote, which only ever stood in
+  // for it. `resolveExtraArgsMcpServers` runs for every acpx lane
+  // (claude/codex/gemini/custom, see constants.ts) and only claude expands:
+  // the codex ACP bridge copies headers verbatim
+  // (`http_headers: Object.fromEntries(mcpServer.headers.map(...))`) and the
+  // codex binary resolves credentials through `bearer_token_env_var` /
+  // `env_http_headers` instead, so a placeholder handed to it goes on the wire
+  // literally and earns a 401. Deciding on the target instead of the agent
+  // would have made that a silent regression — the exact "config field that
+  // looks applied and does nothing" this module exists to end (FIG-1536).
+  //
+  // Remote keeps substituting for its own, separate reason: its child runs
+  // under an env this process does not own.
+  const substituting = input.agent !== "claude" || input.executionTargetIsRemote === true;
+  const pendingSubstituted = new Set<string>();
+  const resolve: Resolver = substituting
+    ? (value) => expandEnv(value, input.env, (name) => pendingSubstituted.add(name))
+    : (value) => validateOnly(value, input.env);
+  return {
+    resolve,
+    substituting,
+    substituted: new Set<string>(),
+    stdioArgPlaceholders: new Set<string>(),
+    pendingSubstituted,
+    pendingStdioArgs: new Set<string>(),
+  };
+}
+
+/**
+ * Substituting is the correct call on these lanes, but it is also the FIG-1550
+ * exposure: say so instead of leaking the credential quietly.
+ */
+function describeSubstitution(input: ResolveExtraArgsMcpInput, plan: ResolvePlan): string | null {
+  if (plan.substituted.size === 0) return null;
+  const names = [...plan.substituted].map((name) => `\${${name}}`).join(", ");
+  const reason =
+    input.agent !== "claude"
+      ? `the "${input.agent}" agent does not expand \${VAR} itself (only "claude" does), so the placeholder cannot be passed through`
+      : "the execution target is remote, whose child env this process does not own";
+  return (
+    `--mcp-config: ${names} substituted into the MCP config because ${reason}. ` +
+    `The value transits the child's argv, which /proc/<pid>/cmdline exposes to every local uid (0444); ` +
+    `prefer a credential the agent reads from its own environment.`
+  );
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -161,8 +266,9 @@ function toHeaderList(
 function toServer(
   name: string,
   entry: Record<string, unknown>,
-  resolve: Resolver,
+  plan: ResolvePlan,
 ): { server: McpServer; identity: ExtraArgsMcpIdentity } | null {
+  const resolve = plan.resolve;
   const type = asTrimmedString(entry.type).toLowerCase();
   const url = asTrimmedString(entry.url);
   const command = asTrimmedString(entry.command);
@@ -179,7 +285,16 @@ function toServer(
   if (command) {
     const expandedCommand = resolve(command);
     const args = Array.isArray(entry.args)
-      ? entry.args.filter((arg): arg is string => typeof arg === "string").map((arg) => resolve(arg))
+      ? entry.args
+          .filter((arg): arg is string => typeof arg === "string")
+          .map((arg) => {
+            // Passing a placeholder through keeps it out of *this* child's
+            // argv, but a stdio server is then spawned by that child from the
+            // expanded args — the value lands in the MCP server process's own
+            // cmdline. Record it so the residue is reported, not implied away.
+            if (!plan.substituting) collectPlaceholderNames(arg, plan.pendingStdioArgs);
+            return resolve(arg);
+          })
       : [];
     const serverEnv = toHeaderList(entry.env, resolve);
     const server = {
@@ -250,7 +365,7 @@ export async function resolveExtraArgsMcpServers(
   const warnings: string[] = [];
   const honoredSources: string[] = [];
   const taken = new Set(input.reservedNames ?? []);
-  const resolve = makeResolver(input);
+  const plan = makeResolvePlan(input);
 
   const { values, unsupported } = collectMcpConfigValues(input.extraArgs);
   if (unsupported.length > 0) {
@@ -278,8 +393,9 @@ export async function resolveExtraArgsMcpServers(
       }
       let built: { server: McpServer; identity: ExtraArgsMcpIdentity } | null;
       try {
-        built = toServer(name, entry, resolve);
+        built = toServer(name, entry, plan);
       } catch (error) {
+        settlePending(plan, false);
         if (error instanceof UnresolvedPlaceholderError) {
           warnings.push(
             `MCP server "${name}" from --mcp-config was skipped: \${${error.variable}} is not set in this agent's env.`,
@@ -288,6 +404,7 @@ export async function resolveExtraArgsMcpServers(
         }
         throw error;
       }
+      settlePending(plan, built !== null);
       if (!built) {
         warnings.push(`MCP server "${name}" from --mcp-config was skipped: neither a url nor a command is declared.`);
         continue;
@@ -298,6 +415,17 @@ export async function resolveExtraArgsMcpServers(
       mounted += 1;
     }
     if (mounted > 0) honoredSources.push(source);
+  }
+
+  const substitutionNote = describeSubstitution(input, plan);
+  if (substitutionNote) warnings.push(substitutionNote);
+  if (plan.stdioArgPlaceholders.size > 0) {
+    const names = [...plan.stdioArgPlaceholders].map((name) => `\${${name}}`).join(", ");
+    warnings.push(
+      `--mcp-config: ${names} is passed through unexpanded in a stdio server's args, but the agent expands args ` +
+        `before spawning that server, so the value still reaches that process's own argv (0444). ` +
+        `A stdio server's env is the only field kept off argv end to end.`,
+    );
   }
 
   return { servers, identities, warnings, honoredSources };
