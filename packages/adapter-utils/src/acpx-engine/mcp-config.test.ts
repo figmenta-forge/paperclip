@@ -24,6 +24,7 @@ describe("resolveExtraArgsMcpServers", () => {
     const result = await resolveExtraArgsMcpServers({
       extraArgs: ["--mcp-config", "/etc/fleet-mcp.json"],
       cwd: "/work",
+      childEnvIsForeign: false,
       agent: "claude",
       env: { VPS_MCP_TOKEN: "t0ken" },
       readFile: readFileFrom({ "/etc/fleet-mcp.json": FLEET_CONFIG }),
@@ -58,6 +59,7 @@ describe("resolveExtraArgsMcpServers", () => {
       const result = await resolveExtraArgsMcpServers({
         extraArgs: ["--mcp-config", "/etc/fleet-mcp.json"],
         cwd: "/work",
+        childEnvIsForeign: false,
         agent,
         env: { VPS_MCP_TOKEN: "t0ken" },
         readFile: readFileFrom({ "/etc/fleet-mcp.json": FLEET_CONFIG }),
@@ -88,6 +90,7 @@ describe("resolveExtraArgsMcpServers", () => {
         `--mcp-config={"mcpServers":{"s":{"command":"srv","args":["--key","\${VPS_MCP_TOKEN}"],"env":{"KEY":"\${VPS_MCP_TOKEN}"}}}}`,
       ],
       cwd: "/work",
+      childEnvIsForeign: false,
       agent: "claude",
       env: { VPS_MCP_TOKEN: "t0ken" },
     });
@@ -123,6 +126,7 @@ describe("resolveExtraArgsMcpServers", () => {
     const result = await resolveExtraArgsMcpServers({
       extraArgs: ["--mcp-config", "/etc/c.json"],
       cwd: "/work",
+      childEnvIsForeign: false,
       agent: "claude",
       // Reachable: execute.ts filters out non-strings only, so an adapterConfig
       // value or a secret_ref that resolves to "" arrives here as an empty
@@ -143,6 +147,7 @@ describe("resolveExtraArgsMcpServers", () => {
     const substituting = await resolveExtraArgsMcpServers({
       extraArgs: ["--mcp-config", "/etc/c.json"],
       cwd: "/work",
+      childEnvIsForeign: false,
       agent: "codex",
       env: { A: "" },
       readFile: readFileFrom({ "/etc/c.json": config }),
@@ -165,6 +170,7 @@ describe("resolveExtraArgsMcpServers", () => {
         `--mcp-config={"mcpServers":{"s":{"type":"http","url":"https://s.example/\${SET}","headers":{"Authorization":"Bearer \${MISSING}"}}}}`,
       ],
       cwd: "/work",
+      childEnvIsForeign: false,
       agent: "codex",
       env: { SET: "t0ken" },
     });
@@ -189,6 +195,7 @@ describe("resolveExtraArgsMcpServers", () => {
     const result = await resolveExtraArgsMcpServers({
       extraArgs: ["--mcp-config", "/etc/c.json"],
       cwd: "/work",
+      childEnvIsForeign: false,
       agent: "claude",
       env: { A: "secret" },
       readFile: readFileFrom({ "/etc/c.json": config }),
@@ -200,7 +207,7 @@ describe("resolveExtraArgsMcpServers", () => {
     expect(JSON.stringify(result)).not.toContain("secret");
   });
 
-  it("keeps substituting for a remote target, whose child env this process does not own", async () => {
+  it("substitutes when the child expands against an env this process does not supply", async () => {
     const inline = JSON.stringify({
       mcpServers: {
         r: { type: "http", url: "https://r.example/mcp", headers: { Authorization: "Bearer ${VPS_MCP_TOKEN}" } },
@@ -209,6 +216,7 @@ describe("resolveExtraArgsMcpServers", () => {
     const result = await resolveExtraArgsMcpServers({
       extraArgs: [`--mcp-config=${inline}`],
       cwd: "/work",
+      childEnvIsForeign: true,
       agent: "claude",
       env: { VPS_MCP_TOKEN: "t0ken" },
       executionTargetIsRemote: true,
@@ -222,14 +230,97 @@ describe("resolveExtraArgsMcpServers", () => {
         headers: [{ name: "Authorization", value: "Bearer t0ken" }],
       },
     ]);
-    expect(result.warnings[0]).toContain("execution target is remote");
+    expect(result.warnings[0]).toContain("an env this process does not supply");
     expect(result.warnings[0]).toContain("${VPS_MCP_TOKEN}");
+  });
+
+  it("passes the placeholder through on a remote target that runs the child under our own env", async () => {
+    const inline = JSON.stringify({
+      mcpServers: {
+        r: { type: "http", url: "https://r.example/mcp", headers: { Authorization: "Bearer ${VPS_MCP_TOKEN}" } },
+      },
+    });
+    // The sandbox shape: remote enough that file-based configs stay unread
+    // (their files live on the remote host), but the child is launched with the
+    // env this process shipped it, so it resolves `${VAR}` itself exactly as a
+    // local claude does. Substituting here would buy nothing and republish the
+    // token into the sandbox child's argv.
+    const result = await resolveExtraArgsMcpServers({
+      extraArgs: [`--mcp-config=${inline}`],
+      cwd: "/work",
+      childEnvIsForeign: false,
+      agent: "claude",
+      env: { VPS_MCP_TOKEN: "t0ken" },
+      executionTargetIsRemote: true,
+    });
+
+    expect(result.servers).toEqual([
+      {
+        type: "http",
+        name: "r",
+        url: "https://r.example/mcp",
+        headers: [{ name: "Authorization", value: "Bearer ${VPS_MCP_TOKEN}" }],
+      },
+    ]);
+    expect(JSON.stringify(result)).not.toContain("t0ken");
+    expect(result.warnings).toEqual([]);
+
+    // The pass-through is claude's alone: the same target on a lane that does
+    // not re-expand still substitutes, because there the literal would go on
+    // the wire and earn a 401.
+    const codex = await resolveExtraArgsMcpServers({
+      extraArgs: [`--mcp-config=${inline}`],
+      cwd: "/work",
+      childEnvIsForeign: false,
+      agent: "codex",
+      env: { VPS_MCP_TOKEN: "t0ken" },
+      executionTargetIsRemote: true,
+    });
+    expect(codex.servers[0]).toMatchObject({
+      headers: [{ name: "Authorization", value: "Bearer t0ken" }],
+    });
+    expect(codex.warnings[0]).toContain('the "codex" agent does not expand');
+  });
+
+  it("names the config's own text in the identity, never the resolved credential", async () => {
+    const result = await resolveExtraArgsMcpServers({
+      extraArgs: [
+        `--mcp-config={"mcpServers":{"s":{"command":"srv-\${VPS_MCP_TOKEN}","args":["--key","\${VPS_MCP_TOKEN}"]},"h":{"type":"http","url":"https://h.example/\${VPS_MCP_TOKEN}"}}}`,
+      ],
+      cwd: "/work",
+      childEnvIsForeign: false,
+      agent: "codex",
+      env: { VPS_MCP_TOKEN: "t0ken" },
+    });
+
+    // "codex" substitutes, so the servers carry the resolved value — correct,
+    // that is what makes them work. The identities must not follow: they travel
+    // back to the host in `sessionParams` and into the config fingerprint, and
+    // neither needs the value.
+    expect(result.servers).toEqual([
+      { name: "s", command: "srv-t0ken", args: ["--key", "t0ken"], env: [] },
+      { type: "http", name: "h", url: "https://h.example/t0ken", headers: [] },
+    ]);
+    expect(result.identities).toEqual([
+      {
+        name: "s",
+        url: "srv-${VPS_MCP_TOKEN} --key ${VPS_MCP_TOKEN}",
+        connectionId: "adapter-config:extraArgs",
+      },
+      {
+        name: "h",
+        url: "https://h.example/${VPS_MCP_TOKEN}",
+        connectionId: "adapter-config:extraArgs",
+      },
+    ]);
+    expect(JSON.stringify(result.identities)).not.toContain("t0ken");
   });
 
   it("accepts --mcp-config=<path>, relative paths, and inline JSON", async () => {
     const inline = await resolveExtraArgsMcpServers({
       extraArgs: [`--mcp-config={"mcpServers":{"inline":{"command":"npx","args":["-y","srv"]}}}`],
       cwd: "/work",
+      childEnvIsForeign: false,
       agent: "claude",
       env: {},
     });
@@ -238,6 +329,7 @@ describe("resolveExtraArgsMcpServers", () => {
     const relative = await resolveExtraArgsMcpServers({
       extraArgs: ["--mcp-config=cfg/mcp.json"],
       cwd: "/work",
+      childEnvIsForeign: false,
       agent: "claude",
       env: { VPS_MCP_TOKEN: "t0ken" },
       readFile: readFileFrom({ "/work/cfg/mcp.json": FLEET_CONFIG }),
@@ -249,6 +341,7 @@ describe("resolveExtraArgsMcpServers", () => {
     const result = await resolveExtraArgsMcpServers({
       extraArgs: ["--mcp-config", "/etc/fleet-mcp.json"],
       cwd: "/work",
+      childEnvIsForeign: false,
       agent: "claude",
       env: {},
       readFile: readFileFrom({ "/etc/fleet-mcp.json": FLEET_CONFIG }),
@@ -264,6 +357,7 @@ describe("resolveExtraArgsMcpServers", () => {
     const result = await resolveExtraArgsMcpServers({
       extraArgs: ["--mcp-config", "/etc/fleet-mcp.json"],
       cwd: "/work",
+      childEnvIsForeign: false,
       agent: "claude",
       env: { VPS_MCP_TOKEN: "t0ken" },
       reservedNames: ["vps-mcp-figmenta"],
@@ -278,6 +372,7 @@ describe("resolveExtraArgsMcpServers", () => {
     const missing = await resolveExtraArgsMcpServers({
       extraArgs: ["--mcp-config", "/etc/gone.json", "--strict-mcp-config"],
       cwd: "/work",
+      childEnvIsForeign: false,
       agent: "claude",
       env: {},
       readFile: readFileFrom({}),
@@ -288,6 +383,7 @@ describe("resolveExtraArgsMcpServers", () => {
     const remote = await resolveExtraArgsMcpServers({
       extraArgs: ["--mcp-config", "/etc/fleet-mcp.json"],
       cwd: "/work",
+      childEnvIsForeign: false,
       agent: "claude",
       env: { VPS_MCP_TOKEN: "t0ken" },
       executionTargetIsRemote: true,
@@ -301,6 +397,7 @@ describe("resolveExtraArgsMcpServers", () => {
     const result = await resolveExtraArgsMcpServers({
       extraArgs: [],
       cwd: "/work",
+      childEnvIsForeign: false,
       agent: "claude",
       env: {},
     });
