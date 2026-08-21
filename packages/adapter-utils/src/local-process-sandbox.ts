@@ -41,9 +41,9 @@ interface NetworkAllowlistProxy {
 }
 
 const SYSTEM_READ_PATHS = [
+  "/usr",
   "/bin",
   "/sbin",
-  "/usr",
   "/lib",
   "/lib64",
   "/etc/ca-certificates",
@@ -294,7 +294,18 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
     const mounted = new Set<string>();
     const mount = async (source: string, access: LocalProcessSandboxAccess) => {
       const normalized = normalizeAbsolutePath(source, "Sandbox path");
-      if (mounted.has(normalized) || !(await pathExists(normalized))) return;
+      if (!(await pathExists(normalized))) return;
+      if (mounted.has(normalized)) return;
+      // merged-usr (Ubuntu 24.04): /bin,/sbin,/lib* are symlinks into /usr. Binding
+      // them fails when /usr is not mounted yet (the bind destination resolves
+      // through the skeleton symlink into a not-yet-mounted /usr) — and once /usr
+      // IS mounted they are redundant. Resolve the REAL path only to decide
+      // coverage; the mount destination stays the original path, so symlinked
+      // files like /etc/resolv.conf keep their expected location in the shell.
+      const real = await fs.realpath(normalized).catch(() => normalized);
+      for (const m of mounted) {
+        if (real === m || real.startsWith(m + "/")) return;
+      }
       addParentDirectories(args, created, normalized);
       args.push(access === "rw" ? "--bind" : "--ro-bind", normalized, normalized);
       mounted.add(normalized);
