@@ -537,6 +537,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             { path: path.join(path.dirname(sharedClaudeConfigDir), ".claude.json"), access: "rw" },
             { path: promptBundle.addDir, access: "ro" },
             { path: localMcpConfigDir, access: "ro" },
+            // The injected system prompt declares the instructions directory
+            // authoritative for sibling files (./HEARTBEAT.md, ./SOUL.md, ./TOOLS.md)
+            // and tells the agent to resolve relative references from there. Under a
+            // workspace filesystem scope that directory is outside the sandbox unless
+            // we bind it, so the directive is unfollowable and the failure looks like
+            // "file does not exist". Read-only: agents must not edit their identity.
+            ...(instructionsFilePath
+              ? ([{ path: path.dirname(instructionsFilePath), access: "ro" }] as const)
+              : []),
           ],
           extraPaths: parseLocalProcessSandboxExtraPaths(config.filesystemExtraPaths),
           homeDir: filesystemScope ? path.dirname(sharedClaudeConfigDir) : null,
